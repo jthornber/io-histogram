@@ -1,0 +1,126 @@
+#!/usr/bin/env ruby
+
+require 'pp'
+
+
+Event = Struct.new(:code, :start_sector, :len_sector)
+
+class IOHistogram
+  def initialize(name, dev_size, nr_bins)
+    @name = name
+    @divisor = dev_size / nr_bins
+    @bins = Array.new(nr_bins) {0}
+  end
+
+  def record_io(start_sector, len)
+    return if len == 0
+
+    start_bin = to_bin(start_sector)
+    end_bin = to_bin(start_sector + len - 1)
+    for b in start_bin..end_bin
+      @bins[b] = @bins[b] + 1
+    end
+  end
+
+  def show_histogram
+    STDERR.puts "#{@name}: #{@bins.join(", ")}"
+  end
+
+  private
+  def to_bin(sector)
+    sector / @divisor
+  end
+end
+
+#----------------------------------------------------------------
+
+def dev_size(dev)
+  `blockdev --getsz #{dev}`.chomp.to_i
+end
+
+def follow_link(path)
+  File.symlink?(path) ? File.readlink(path) : path
+end
+
+def to_event_type(cs)
+  r = Array.new
+
+  cs.each_char do |c|
+    case c
+    when 'D'
+      r << :discard
+
+    when 'R'
+      r << :read
+
+    when 'W'
+      r << :write
+
+    when 'S'
+      r << :sync
+
+    else
+      raise "Unknown blktrace event type: '#{c}'"
+    end
+  end
+
+  r
+end
+
+def filter_events(event_type, events)
+  # FIXME: support multiple event_types?
+  r = Array.new
+  events.each_index do |i|
+    r.push(events[i]) if events[i].code.member?(event_type)
+  end
+  r
+end
+
+def parse_pattern(complete)
+  # The S (sleep requested) action can be present in addition to the ones we're interested in
+  if complete
+    /C ([DRW])S? (\d+) (\d+)/
+  else
+    /Q ([DRW])S? (\d+) (\d+)/
+  end
+end
+
+def blkparse(trace_file, complete)
+  events = Array.new
+  pattern = parse_pattern(complete)
+
+  `blkparse -f \"%a %d %S %N\n\" #{trace_file}`.lines.each do |l|
+    m = pattern.match(l)
+    events.push(Event.new(to_event_type(m[1]), m[2].to_i, m[3].to_i / 512)) if m
+  end
+
+  events
+end
+
+def blktrace_histogram(trace_file)
+  trace = blkparse(trace_file, false)
+
+  len = 0
+  trace.each do |e|
+    len = [e.start_sector + e.len_sector, len].max
+  end
+
+  read_histogram = IOHistogram.new("read", len, 128)
+  write_histogram = IOHistogram.new("write", len, 128)
+
+  trace.each do |e|
+    if e.code.member?(:write)
+      write_histogram.record_io(e.start_sector, e.len_sector)
+    elsif e.code.member?(:read)
+      read_histogram.record_io(e.start_sector, e.len_sector)
+    end
+  end
+
+  read_histogram.show_histogram
+  write_histogram.show_histogram
+end
+
+trace_file = ARGV.shift
+blktrace_histogram(trace_file)
+
+#----------------------------------------------------------------
